@@ -1,17 +1,18 @@
 // ==UserScript==
 // @name         UNIT3D Favorite Subtitle Flags
 // @namespace    http://tampermonkey.net/
-// @version      0.3
+// @version      0.4
 // @description  Show flags for favorite subtitle languages on UNIT3D torrents
 // @author       gizeto
 // @match        */torrents
 // @match        */torrents?*
 // @match        */torrents/similar/*
 // @icon         https://hdinnovations.github.io/HDInnovations/media/favicon.ico
+// @updateURL    https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.js
+// @downloadURL  https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
-// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (function () {
@@ -19,11 +20,12 @@
 
     const STORAGE_KEYS = {
         FAVORITE_SUBS: 'unit3d_favorite_subs',
-        API_KEYS: 'unit3d_api_keys'
+        API_KEYS: 'unit3d_api_keys',
+        SUBTITLE_LANGUAGE_CACHE: 'unit3d_subtitle_language_cache'
     };
 
     const DEFAULT_FAVORITE_SUBS = ['English'];
-    const DEFAULT_API_KEYS = {};
+    const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
     // Map language names from MediaInfo to country codes for flags
     // Source: https://raw.githubusercontent.com/HDInnovations/UNIT3D/master/app/Helpers/Helpers.php
@@ -88,54 +90,38 @@
         'Welsh': 'gb-wls'
     };
 
+    function isObject(value) {
+        return value && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function parseStoredJson(value) {
+        if (typeof value !== 'string') {
+            return value;
+        }
+
+        try {
+            return JSON.parse(value);
+        } catch (e) {
+            return null;
+        }
+    }
+
     function loadFavoriteSubs() {
         const stored = GM_getValue(STORAGE_KEYS.FAVORITE_SUBS, null);
-        if (stored !== null && stored !== undefined) {
-            if (typeof stored === 'string') {
-                if (!stored.trim()) {
-                    return [];
-                }
-                try {
-                    const parsed = JSON.parse(stored);
-                    if (Array.isArray(parsed)) {
-                        return parsed;
-                    }
-                } catch (e) {
-                    // Ignore parse errors and fall back to comma parsing
-                }
-                return stored.split(',').map(sub => sub.trim()).filter(Boolean);
-            }
-
-            if (Array.isArray(stored)) {
-                return stored;
-            }
+        const parsed = parseStoredJson(stored);
+        if (Array.isArray(parsed)) {
+            return parsed;
+        }
+        if (typeof stored === 'string') {
+            return stored.split(',').map(sub => sub.trim()).filter(Boolean);
         }
 
         return DEFAULT_FAVORITE_SUBS.slice();
     }
 
     function loadApiKeys() {
-        const stored = GM_getValue(STORAGE_KEYS.API_KEYS, null);
-        if (stored !== null && stored !== undefined) {
-            if (typeof stored === 'string') {
-                if (!stored.trim()) {
-                    return {};
-                }
-
-                try {
-                    const parsed = JSON.parse(stored);
-                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                        return { ...DEFAULT_API_KEYS, ...parsed };
-                    }
-                } catch (e) {
-                    // Ignore parse errors and fall back to defaults
-                }
-            } else if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
-                return { ...DEFAULT_API_KEYS, ...stored };
-            }
-        }
-
-        return { ...DEFAULT_API_KEYS };
+        const parsed = parseStoredJson(GM_getValue(STORAGE_KEYS.API_KEYS, null));
+        return isObject(parsed) ? parsed : {};
     }
 
     function saveFavoriteSubs(subs) {
@@ -146,6 +132,12 @@
     function saveApiKeys(keys) {
         GM_setValue(STORAGE_KEYS.API_KEYS, JSON.stringify(keys));
         CONFIG.API_KEYS = keys;
+    }
+
+    function loadSubtitleCache() {
+        const emptyCache = { hosts: {} };
+        const parsed = parseStoredJson(GM_getValue(STORAGE_KEYS.SUBTITLE_LANGUAGE_CACHE, null));
+        return isObject(parsed) && isObject(parsed.hosts) ? parsed : emptyCache;
     }
 
     function registerMenuCommands() {
@@ -188,181 +180,207 @@
 
     registerMenuCommands();
 
-    const DEBUG_LOG = false;
-    function logDebug(...args) {
-        if (!DEBUG_LOG) return;
-        console.log('Unit3D Favorite Subtitle Flags [debug]', ...args);
-    }
+    const subtitleCache = loadSubtitleCache();
+    let subtitleCacheDirty = false;
+    let rateLimitedUrl = null;
 
-    // Helper to get country code from language string
-    function getFlagCode(language) {
-        // 1. Try exact match
-        if (LANG_MAP[language]) {
-            const code = LANG_MAP[language];
-            logDebug('Flag match exact', language, code);
-            return code;
+    function getHostCache() {
+        const hostnameKey = `host:${window.location.hostname}`;
+        const existing = subtitleCache.hosts[hostnameKey];
+        if (isObject(existing)) {
+            return existing;
         }
 
-        // 2. Try matching by splitting (e.g. "English (US)" -> "English")
+        subtitleCache.hosts[hostnameKey] = {};
+        return subtitleCache.hosts[hostnameKey];
+    }
+
+    function isValidCacheEntry(entry, now = Date.now()) {
+        return entry
+            && Array.isArray(entry.languages)
+            && entry.languages.every(language => typeof language === 'string')
+            && Number.isFinite(entry.cachedAt)
+            && entry.cachedAt <= now
+            && now - entry.cachedAt < CACHE_MAX_AGE_MS;
+    }
+
+    function pruneExpiredHostCache() {
+        const hostCache = getHostCache();
+        const now = Date.now();
+
+        Object.entries(hostCache).forEach(([torrentId, entry]) => {
+            if (!isValidCacheEntry(entry, now)) {
+                delete hostCache[torrentId];
+                subtitleCacheDirty = true;
+            }
+        });
+    }
+
+    function cacheLanguages(torrentId, languages) {
+        getHostCache()[torrentId] = {
+            languages: languages.slice(),
+            cachedAt: Date.now()
+        };
+        subtitleCacheDirty = true;
+    }
+
+    function flushSubtitleCache() {
+        if (!subtitleCacheDirty) {
+            return;
+        }
+
+        GM_setValue(STORAGE_KEYS.SUBTITLE_LANGUAGE_CACHE, JSON.stringify(subtitleCache));
+        subtitleCacheDirty = false;
+    }
+
+    function getFlagCode(language) {
+        if (LANG_MAP[language]) {
+            return LANG_MAP[language];
+        }
+
         const baseLang = language.split('(')[0].trim();
         if (LANG_MAP[baseLang]) {
-            const code = LANG_MAP[baseLang];
-            logDebug('Flag match base', language, '->', baseLang, code);
-            return code;
+            return LANG_MAP[baseLang];
         }
 
-        // 3. Fallback: partial match (careful with this)
-        for (const [lang, code] of Object.entries(LANG_MAP)) {
-            if (language.includes(lang)) {
-                logDebug('Flag match partial', language, '->', lang, code);
-                return code;
-            }
-        }
-        logDebug('Flag match failed', language);
-        return null;
+        return Object.entries(LANG_MAP).find(([lang]) => language.includes(lang))?.[1] || null;
     }
 
-    // Helper to get API key for current domain
     function getApiKey() {
-        const hostname = window.location.hostname;
-        return CONFIG.API_KEYS[hostname];
+        return CONFIG.API_KEYS[window.location.hostname];
     }
 
-    // Extract TMDB ID and Category ID from URL
-    function getPageContext() {
-        const url = window.location.href;
-        // Pattern: .../similar/[category_id].[tmdb_id]
-        const similarMatch = url.match(/similar\/(\d+)\.(\d+)/);
-        if (similarMatch) {
-            return { categoryId: similarMatch[1], tmdbId: similarMatch[2] };
-        }
-
-        // Fallback or other page types could be added here
-        return null;
+    function getSimilarTmdbId() {
+        return window.location.pathname.match(/similar\/\d+\.(\d+)/)?.[1] || null;
     }
 
     function parseSubtitles(attributes) {
         const subtitles = new Set();
-        logDebug('parseSubtitles start', {
-            hasMediaInfo: Boolean(attributes.media_info),
-            hasBdInfo: Boolean(attributes.bd_info),
-            mediaInfoLength: attributes.media_info ? attributes.media_info.length : 0,
-            bdInfoLength: attributes.bd_info ? attributes.bd_info.length : 0
-        });
 
         if (attributes.media_info) {
-            // Split MediaInfo into sections (separated by blank lines)
-            const sections = attributes.media_info.split(/\n\s*\n/);
-            logDebug('MediaInfo sections', sections.length);
-
-            sections.forEach(section => {
+            attributes.media_info.split(/\n\s*\n/).forEach(section => {
                 const trimmedSection = section.trim();
-                // Check if section starts with "Text" (e.g. "Text", "Text #1")
                 if (/^Text/i.test(trimmedSection)) {
-                    // Extract Language field from this section
                     const match = /Language\s*:\s*([^\n\r]+)/i.exec(trimmedSection);
                     if (match) {
-                        let lang = match[1].trim();
-                        // Keep full language string for better flag matching
-                        subtitles.add(lang);
-                        logDebug('Found subtitle in MediaInfo', lang);
-                    } else {
-                        logDebug('Text section without language', trimmedSection.slice(0, 120));
+                        subtitles.add(match[1].trim());
                     }
                 }
             });
         }
 
         if (attributes.bd_info) {
-            // Regex for BDInfo: "Subtitle: English / ..."
             const regex = /Subtitle\s*:\s*([^\/]+)/gi;
             let match;
 
             while ((match = regex.exec(attributes.bd_info)) !== null) {
-                let lang = match[1].trim();
-                // Keep full language string
-                subtitles.add(lang);
-                logDebug('Found subtitle in BDInfo', lang);
+                subtitles.add(match[1].trim());
             }
         }
 
-        logDebug('parseSubtitles result', Array.from(subtitles));
         return Array.from(subtitles);
     }
 
-    function injectFlags(torrents) {
-        const torrentRows = document.querySelectorAll('.torrent-search--grouped__name');
+    function collectVisibleTorrents() {
+        const visible = [];
 
-        torrentRows.forEach(row => {
-            const link = row.querySelector('a[href*="/torrents/"]');
-            if (!link) return;
-
-            const href = link.getAttribute('href');
-            const torrentIdMatch = href.match(/\/torrents\/(\d+)/);
-            if (!torrentIdMatch) return;
-
-            const torrentId = torrentIdMatch[1];
-            const torrentData = torrents.find(t => t.id == torrentId);
-
-            if (torrentData && torrentData.attributes && (torrentData.attributes.media_info || torrentData.attributes.bd_info)) {
-                const subtitles = parseSubtitles(torrentData.attributes);
-                const favoriteSubs = subtitles.filter(sub =>
-                    CONFIG.FAVORITE_SUBS.some(fav => sub.includes(fav))
-                );
-                logDebug('Grouped row', torrentId, { subtitles, favoriteSubs });
-
-                if (favoriteSubs.length > 0) {
-                    let flagContainer = row.querySelector('.unit3d-flag-container');
-                    if (!flagContainer) {
-                        flagContainer = document.createElement('span');
-                        flagContainer.className = 'unit3d-flag-container';
-                        flagContainer.style.marginLeft = '10px';
-                        flagContainer.style.display = 'inline-flex';
-                        flagContainer.style.alignItems = 'center';
-                        flagContainer.style.gap = '3px';
-                    } else {
-                        flagContainer.innerHTML = '';
-                    }
-
-                    favoriteSubs.forEach(sub => {
-                        const code = getFlagCode(sub);
-                        if (code) {
-                            const img = document.createElement('img');
-                            img.src = `/img/flags/${code}.png`;
-                            img.title = sub;
-                            img.style.height = '11px';
-                            img.style.verticalAlign = 'middle';
-                            flagContainer.appendChild(img);
-                        }
-                    });
-
-                    if (flagContainer.children.length > 0) {
-                        row.style.display = 'flex';
-                        row.style.alignItems = 'center';
-                        row.style.flexWrap = 'wrap';
-
-                        if (!flagContainer.isConnected) {
-                            row.appendChild(flagContainer);
-                        }
-                    } else if (flagContainer.isConnected) {
-                        flagContainer.remove();
-                    }
-                }
+        document.querySelectorAll('.torrent-search--list__row').forEach(row => {
+            const id = row.getAttribute('data-torrent-id');
+            if (!id) {
+                return;
             }
+
+            visible.push({
+                id,
+                layout: 'search',
+                renderTarget: row
+            });
         });
+
+        document.querySelectorAll('.torrent-search--grouped__name').forEach(name => {
+            const link = name.querySelector('a[href*="/torrents/"]');
+            const torrentIdMatch = link && link.getAttribute('href').match(/\/torrents\/(\d+)/);
+            if (!torrentIdMatch) {
+                return;
+            }
+
+            visible.push({
+                id: torrentIdMatch[1],
+                layout: 'grouped',
+                renderTarget: name
+            });
+        });
+
+        return visible;
+    }
+
+    function createFlagContainer(layout) {
+        const container = document.createElement('span');
+        container.className = 'unit3d-flag-container';
+        container.style.display = 'inline-flex';
+        container.style.alignItems = 'center';
+        container.style.gap = '3px';
+        container.style.marginLeft = layout === 'grouped' ? '10px' : '6px';
+        return container;
+    }
+
+    function renderLanguages(visibleTorrent, languages) {
+        const favoriteSubs = languages.filter(sub =>
+            CONFIG.FAVORITE_SUBS.some(fav => sub.includes(fav))
+        );
+        const target = visibleTorrent.renderTarget;
+        const parent = visibleTorrent.layout === 'grouped'
+            ? target
+            : target.querySelector('.torrent-icons');
+
+        if (!parent) {
+            return;
+        }
+
+        let flagContainer = parent.querySelector('.unit3d-flag-container');
+        if (favoriteSubs.length === 0) {
+            if (flagContainer) {
+                flagContainer.remove();
+            }
+            return;
+        }
+
+        if (!flagContainer) {
+            flagContainer = createFlagContainer(visibleTorrent.layout);
+            parent.appendChild(flagContainer);
+        } else {
+            flagContainer.innerHTML = '';
+        }
+
+        favoriteSubs.forEach(sub => {
+            const code = getFlagCode(sub);
+            if (!code) {
+                return;
+            }
+
+            const img = document.createElement('img');
+            img.src = `/img/flags/${code}.png`;
+            img.title = sub;
+            img.style.height = '11px';
+            img.style.verticalAlign = 'middle';
+            flagContainer.appendChild(img);
+        });
+
+        if (flagContainer.children.length === 0) {
+            flagContainer.remove();
+            return;
+        }
+
+        if (visibleTorrent.layout === 'grouped') {
+            target.style.display = 'flex';
+            target.style.alignItems = 'center';
+            target.style.flexWrap = 'wrap';
+        }
     }
 
     function toInt(val) {
         const n = parseInt(val, 10);
         return Number.isNaN(n) ? null : n;
-    }
-
-    function toBool(val) {
-        if (val === null || val === undefined) return null;
-        const lower = String(val).toLowerCase();
-        if (lower === 'true' || lower === '1') return true;
-        if (lower === 'false' || lower === '0') return false;
-        return null;
     }
 
     function buildApiParamsFromSearchUrl() {
@@ -374,27 +392,23 @@
             typeIds: 'types',
             resolutionIds: 'resolutions',
             genreIds: 'genres',
-            primaryLanguageNames: 'primaryLanguageNames'
+            primaryLanguageNames: 'primaryLanguages',
+            free: 'free'
         };
 
-        const booleanKeys = new Set(['doubleup', 'featured', 'refundable', 'stream', 'sd', 'highspeed', 'internal', 'personalRelease', 'alive', 'dying', 'dead', 'notDownloaded']);
-        const numericKeys = new Set(['startYear', 'endYear', 'tmdbId', 'imdbId', 'tvdbId', 'malId', 'playlistId', 'collectionId', 'free', 'seasonNumber', 'episodeNumber', 'page', 'perPage']);
+        const booleanKeys = new Set(['doubleup', 'featured', 'refundable', 'highspeed', 'internal', 'personalRelease', 'alive', 'dying', 'dead']);
+        const numericKeys = new Set(['startYear', 'endYear', 'tmdbId', 'imdbId', 'tvdbId', 'malId', 'playlistId', 'collectionId', 'seasonNumber', 'episodeNumber', 'page', 'perPage']);
         const passthroughKeys = new Set(['name', 'description', 'mediainfo', 'bdinfo', 'uploader', 'keywords', 'file_name', 'sortField', 'sortDirection']);
-        const freeValues = [];
 
         for (const [rawKey, rawVal] of params.entries()) {
-            if (rawVal === null || rawVal === undefined || String(rawVal).trim() === '') {
+            if (!rawVal.trim()) {
                 continue;
             }
 
-            const arrayMatch = rawKey.match(/^(\w+)\[(\d+)\]$/);
+            const arrayMatch = rawKey.match(/^(\w+)\[\d+\]$/);
             if (arrayMatch) {
                 const baseKey = arrayMatch[1];
                 const apiKey = arrayParamMap[baseKey];
-                if (baseKey === 'free') {
-                    freeValues.push(rawVal);
-                    continue;
-                }
                 if (!apiKey) {
                     continue;
                 }
@@ -420,9 +434,8 @@
             }
 
             if (booleanKeys.has(rawKey)) {
-                const b = toBool(rawVal);
-                if (b !== null) {
-                    apiParams[rawKey] = b;
+                if (rawVal === 'true' || rawVal === '1') {
+                    apiParams[rawKey] = true;
                 }
                 continue;
             }
@@ -430,13 +443,6 @@
             if (rawKey === 'minSize' || rawKey === 'maxSize') {
                 // Handle after loop with multipliers
                 continue;
-            }
-        }
-
-        if (freeValues.length > 0) {
-            const firstFree = toInt(freeValues[0]);
-            if (firstFree !== null) {
-                apiParams.free = firstFree;
             }
         }
 
@@ -476,187 +482,172 @@
         return search.toString();
     }
 
-    function mergeUniqueTorrents(...lists) {
-        const map = new Map();
-        lists.flat().forEach(torrent => {
-            if (torrent && torrent.id !== undefined && torrent.id !== null) {
-                map.set(torrent.id, torrent);
+    async function fetchApiJson(url, apiKey) {
+        if (rateLimitedUrl === window.location.href) {
+            return null;
+        }
+
+        try {
+            const response = await fetch(url, {
+                headers: {
+                    'Accept': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                }
+            });
+            if (response.status === 429) {
+                rateLimitedUrl = window.location.href;
+                console.warn('Unit3D Favorite Subtitle Flags: API rate limit reached. Stopping requests for this page.');
+                return null;
             }
-        });
-        return Array.from(map.values());
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            return await response.json();
+        } catch (e) {
+            console.error(`Unit3D Favorite Subtitle Flags: Error fetching ${url}`, e);
+            return null;
+        }
     }
 
     async function fetchFilteredTorrents(apiParams, apiKey) {
-        const headers = {
-            'Accept': 'application/json'
-        };
+        const json = await fetchApiJson(`/api/torrents/filter?${buildApiQuery(apiParams)}`, apiKey);
+        return Array.isArray(json?.data) ? json.data : [];
+    }
 
-        if (apiKey) {
-            headers.Authorization = `Bearer ${apiKey}`;
+    async function fetchTorrentById(torrentId, apiKey) {
+        const json = await fetchApiJson(`/api/torrents/${torrentId}`, apiKey);
+        const torrent = isObject(json?.data) ? json.data : json;
+        return isObject(torrent) && torrent.id != null && isObject(torrent.attributes) ? torrent : null;
+    }
+
+    function recordTorrentLanguages(torrent, visibleById) {
+        if (!torrent || torrent.id == null || !torrent.attributes) {
+            return null;
         }
 
-        const query = buildApiQuery(apiParams);
-        const url = `/api/torrents/filter?${query}`;
+        const torrentId = String(torrent.id);
+        const languages = parseSubtitles(torrent.attributes);
+        const visibleTorrent = visibleById.get(torrentId);
 
-        try {
-            const response = await fetch(url, { headers });
+        cacheLanguages(torrentId, languages);
+        if (visibleTorrent) {
+            renderLanguages(visibleTorrent, languages);
+        }
 
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
+        return torrentId;
+    }
+
+    async function resolveVisibleTorrents(visibleTorrents, fetchBulkTorrents, apiKey) {
+        const visibleById = new Map(visibleTorrents.map(torrent => [torrent.id, torrent]));
+        pruneExpiredHostCache();
+        const hostCache = getHostCache();
+        const uncachedTorrents = visibleTorrents.filter(torrent => {
+            const entry = hostCache[torrent.id];
+            if (!entry) {
+                return true;
             }
-
-            const json = await response.json();
-            return json.data || [];
-        } catch (e) {
-            console.error('Unit3D Favorite Subtitle Flags: Error fetching torrents', e);
-            return [];
-        }
-    }
-
-    async function fetchSearchTorrentsWithExtras(apiParams, apiKey) {
-        const page = apiParams.page || 1;
-        const requests = [];
-
-        // Current page
-        requests.push(fetchFilteredTorrents(apiParams, apiKey));
-        logDebug('Queue fetch current page', apiParams);
-
-        // Previous page to cover featured items pinned on later pages
-        if (page > 1) {
-            const prevParams = { ...apiParams, page: page - 1 };
-            requests.push(fetchFilteredTorrents(prevParams, apiKey));
-            logDebug('Queue fetch previous page', prevParams);
-        }
-
-        // Featured torrents when on first page (or page not specified)
-        if (!('page' in apiParams) || page === 1) {
-            const featuredParams = { featured: true, perPage: 100 };
-            requests.push(fetchFilteredTorrents(featuredParams, apiKey));
-            logDebug('Queue fetch featured torrents', featuredParams);
-        }
-
-        const results = await Promise.all(requests);
-        const merged = mergeUniqueTorrents(...results);
-        logDebug('Merged torrents', {
-            requests: requests.length,
-            beforeMergeCounts: results.map(r => (Array.isArray(r) ? r.length : 0)),
-            mergedCount: merged.length
+            renderLanguages(torrent, entry.languages);
+            return false;
         });
-        return merged;
-    }
 
-    function injectFlagsIntoSearch(torrents) {
-        const rows = document.querySelectorAll('.torrent-search--list__row');
+        if (uncachedTorrents.length === 0) {
+            return;
+        }
 
-        rows.forEach(row => {
-            const torrentId = row.getAttribute('data-torrent-id');
-            if (!torrentId) return;
+        if (!apiKey) {
+            console.log(`Unit3D Favorite Subtitle Flags: No API Key set for ${window.location.hostname}. Use the Tampermonkey menu "Set API key for this site".`);
+            return;
+        }
 
-            const torrentData = torrents.find(t => t.id == torrentId);
-            if (torrentData && torrentData.attributes && (torrentData.attributes.media_info || torrentData.attributes.bd_info)) {
-                const subtitles = parseSubtitles(torrentData.attributes);
-                const favoriteSubs = subtitles.filter(sub =>
-                    CONFIG.FAVORITE_SUBS.some(fav => sub.includes(fav))
-                );
-                logDebug('Search row', torrentId, { subtitles, favoriteSubs });
+        const bulkTorrents = await fetchBulkTorrents();
+        if (rateLimitedUrl === window.location.href) {
+            return;
+        }
 
-                if (favoriteSubs.length > 0) {
-                    const icons = row.querySelector('.torrent-icons');
-                    if (!icons) return;
-
-                    let flagContainer = icons.querySelector('.unit3d-flag-container');
-                    if (!flagContainer) {
-                        flagContainer = document.createElement('span');
-                        flagContainer.className = 'unit3d-flag-container';
-                        flagContainer.style.display = 'inline-flex';
-                        flagContainer.style.alignItems = 'center';
-                        flagContainer.style.gap = '3px';
-                        flagContainer.style.marginLeft = '6px';
-                        icons.appendChild(flagContainer);
-                    } else {
-                        flagContainer.innerHTML = '';
-                    }
-
-                    favoriteSubs.forEach(sub => {
-                        const code = getFlagCode(sub);
-                        if (code) {
-                            const img = document.createElement('img');
-                            img.src = `/img/flags/${code}.png`;
-                            img.title = sub;
-                            img.style.height = '11px';
-                            img.style.verticalAlign = 'middle';
-                            flagContainer.appendChild(img);
-                        }
-                    });
-
-                    if (flagContainer.children.length === 0) {
-                        flagContainer.remove();
-                    }
-                }
+        const bulkIds = new Set();
+        bulkTorrents.forEach(torrent => {
+            const torrentId = recordTorrentLanguages(torrent, visibleById);
+            if (torrentId !== null) {
+                bulkIds.add(torrentId);
             }
         });
-    }
 
-    function isTorrentDetailsPage() {
-        return /\/torrents\/\d+(?:\/|$)/.test(window.location.pathname);
+        const currentVisibleIds = new Set(collectVisibleTorrents().map(torrent => torrent.id));
+        if (uncachedTorrents.some(torrent => !currentVisibleIds.has(torrent.id))) {
+            return;
+        }
+
+        for (const visibleTorrent of uncachedTorrents) {
+            if (rateLimitedUrl === window.location.href) {
+                return;
+            }
+            if (bulkIds.has(visibleTorrent.id)) {
+                continue;
+            }
+            const torrent = await fetchTorrentById(visibleTorrent.id, apiKey);
+            if (torrent) {
+                recordTorrentLanguages(torrent, visibleById);
+            }
+        }
     }
 
     async function init() {
-        if (isTorrentDetailsPage()) {
+        if (/\/torrents\/\d+(?:\/|$)/.test(window.location.pathname)) {
             return;
         }
 
-        const apiKey = getApiKey();
-        if (!apiKey) {
-            console.log(`Unit3D Favorite Subtitle Flags: No API Key set for ${window.location.hostname}. Use the Tampermonkey menu "Set API key for this site". Aborting.`);
-            return;
-        }
-
-        const searchRows = document.querySelectorAll('.torrent-search--list__row');
-        const similarRows = document.querySelectorAll('.torrent-search--grouped__name');
-
-        if ((!searchRows || searchRows.length === 0) && (!similarRows || similarRows.length === 0)) {
+        const visibleTorrents = collectVisibleTorrents();
+        if (visibleTorrents.length === 0) {
             console.log('Unit3D Favorite Subtitle Flags: No torrent rows found on this page. Aborting.');
             return;
         }
 
-
-        if (searchRows && searchRows.length > 0) {
-            const apiParams = buildApiParamsFromSearchUrl();
-            console.log('Unit3D Favorite Subtitle Flags: Fetching torrents for search', apiParams);
-            const torrents = await fetchSearchTorrentsWithExtras(apiParams, apiKey);
-            console.log(`Unit3D Favorite Subtitle Flags: Found ${torrents.length} torrents for search (merged).`);
-            if (torrents.length > 0) {
-                injectFlagsIntoSearch(torrents);
+        const apiKey = getApiKey();
+        try {
+            if (visibleTorrents.some(torrent => torrent.layout === 'search')) {
+                const apiParams = buildApiParamsFromSearchUrl();
+                await resolveVisibleTorrents(
+                    visibleTorrents,
+                    () => fetchFilteredTorrents(apiParams, apiKey),
+                    apiKey
+                );
+                return;
             }
-            return;
-        }
 
-        const context = getPageContext();
-        if (!context) {
-            console.log('Unit3D Favorite Subtitle Flags: Could not determine page context (TMDB ID/Category).');
-            return;
-        }
+            const tmdbId = getSimilarTmdbId();
+            if (!tmdbId) {
+                console.log('Unit3D Favorite Subtitle Flags: Could not determine page context (TMDB ID/Category).');
+                return;
+            }
 
-        console.log(`Unit3D Favorite Subtitle Flags: Fetching torrents for TMDB ${context.tmdbId} (Cat: ${context.categoryId})...`);
-        const torrents = await fetchFilteredTorrents({ perPage: 100, tmdbId: context.tmdbId }, apiKey);
-        console.log(`Unit3D Favorite Subtitle Flags: Found ${torrents.length} torrents.`);
-
-        if (torrents.length > 0) {
-            injectFlags(torrents);
+            await resolveVisibleTorrents(
+                visibleTorrents,
+                () => fetchFilteredTorrents({ perPage: 100, tmdbId }, apiKey),
+                apiKey
+            );
+        } finally {
+            flushSubtitleCache();
         }
     }
 
     let lastUrl = null;
     let isProcessing = false;
+    let runPending = false;
+    let domChangeTimer = null;
+    let lastTorrentIds = null;
 
     async function runForCurrentUrl() {
+        runPending = true;
         if (isProcessing) {
             return;
         }
+
         isProcessing = true;
         try {
-            await init();
+            while (runPending) {
+                runPending = false;
+                await init();
+            }
         } finally {
             isProcessing = false;
         }
@@ -671,23 +662,39 @@
         runForCurrentUrl();
     }
 
+    function startTorrentRowObserver() {
+        lastTorrentIds = collectVisibleTorrents().map(torrent => torrent.id).join(',');
+
+        const observer = new MutationObserver(() => {
+            const torrentIds = collectVisibleTorrents().map(torrent => torrent.id).join(',');
+            if (torrentIds === lastTorrentIds) {
+                return;
+            }
+            lastTorrentIds = torrentIds;
+
+            clearTimeout(domChangeTimer);
+            domChangeTimer = setTimeout(runForCurrentUrl, 50);
+        });
+
+        observer.observe(document.body, {
+            subtree: true,
+            childList: true
+        });
+    }
+
     function startLocationObserver() {
         lastUrl = window.location.href;
         runForCurrentUrl();
+        startTorrentRowObserver();
 
-        const origPushState = history.pushState;
-        history.pushState = function () {
-            const ret = origPushState.apply(this, arguments);
-            window.dispatchEvent(new Event('unit3d:locationchange'));
-            return ret;
-        };
-
-        const origReplaceState = history.replaceState;
-        history.replaceState = function () {
-            const ret = origReplaceState.apply(this, arguments);
-            window.dispatchEvent(new Event('unit3d:locationchange'));
-            return ret;
-        };
+        ['pushState', 'replaceState'].forEach(method => {
+            const original = history[method];
+            history[method] = function () {
+                const result = original.apply(this, arguments);
+                window.dispatchEvent(new Event('unit3d:locationchange'));
+                return result;
+            };
+        });
 
         window.addEventListener('popstate', onLocationChange);
         window.addEventListener('unit3d:locationchange', onLocationChange);
