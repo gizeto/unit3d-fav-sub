@@ -1,3 +1,5 @@
+# Moved to https://github.com/gizeto/unit3d-scripts
+
 # UNIT3D Favorite Subtitle Flags
 
 Userscript that shows flag icons for your favorite subtitle languages on UNIT3D torrent search and similar pages. It reads MediaInfo/BDInfo from the API, highlights matches, and supports favorite language selection per user plus API keys per site.
