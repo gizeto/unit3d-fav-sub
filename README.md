@@ -4,7 +4,7 @@ Userscript that shows flag icons for your favorite subtitle languages on UNIT3D 
 
 ## Install
 - Tampermonkey: Dashboard -> Utilities -> *Import from URL*, paste the link and install.
-  https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.js
+  https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.user.js
 - Tampermonkey automatically checks the raw `main` branch script for newer versions.
 
 ## Setup

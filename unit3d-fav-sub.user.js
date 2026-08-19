@@ -8,8 +8,8 @@
 // @match        */torrents?*
 // @match        */torrents/similar/*
 // @icon         https://hdinnovations.github.io/HDInnovations/media/favicon.ico
-// @updateURL    https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.js
-// @downloadURL  https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.js
+// @updateURL    https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.user.js
+// @downloadURL  https://raw.githubusercontent.com/gizeto/unit3d-fav-sub/main/unit3d-fav-sub.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
